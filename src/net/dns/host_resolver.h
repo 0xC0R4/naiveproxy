@@ -365,6 +365,11 @@ class NET_EXPORT HostResolver {
     // An experimental options for features::kUseDnsHttpsSvcb
     // and features::kUseDnsHttpsSvcbAlpn.
     std::optional<HostResolver::HttpsSvcbOptions> https_svcb_options;
+
+    // If false, the system resolver runs only when no DnsTask can run for a
+    // request; it is not queued as a fallback after a DnsTask, so a failed
+    // DnsTask fails the request.
+    bool allow_fallback_to_system_task = true;
   };
 
   // Factory class. Useful for classes that need to inject and override resolver

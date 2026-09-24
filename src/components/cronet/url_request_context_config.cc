@@ -940,6 +940,11 @@ void URLRequestContextConfig::SetContextBuilderExperimentalOptions(
           false;
       host_resolver_manager_options.dns_config_overrides.dns_over_https_config =
           net::DnsOverHttpsConfig();  // Empty config, no DoH servers
+      // The override nameservers are the only resolver for the names this
+      // engine looks up. A system resolver fallback that succeeds is counted
+      // by DnsClient, and after kMaxInsecureFallbackFailures the override is
+      // no longer queried for the rest of the context's life.
+      host_resolver_manager_options.allow_fallback_to_system_task = false;
     }
 
     if (!is_network_bound) {

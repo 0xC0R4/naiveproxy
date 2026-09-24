@@ -487,7 +487,8 @@ HostResolverManager::HostResolverManager(
   DCHECK(options.dns_config_overrides == DnsConfigOverrides());
 #endif
 
-  allow_fallback_to_systemtask_ = !ConfigureAsyncDnsNoFallbackFieldTrial();
+  allow_fallback_to_systemtask_ = options.allow_fallback_to_system_task &&
+                                  !ConfigureAsyncDnsNoFallbackFieldTrial();
 }
 
 HostResolverManager::~HostResolverManager() {
