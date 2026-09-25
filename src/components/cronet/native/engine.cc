@@ -37,8 +37,7 @@
 #include "net/cert/multi_threaded_cert_verifier.h"
 #include "net/cert/x509_certificate.h"
 #include "net/cert/x509_util.h"
-#include "net/http/http_network_session.h"
-#include "net/http/http_transaction_factory.h"
+#include "net/socket/custom_client_socket_factory.h"
 #include "net/url_request/url_request_context.h"
 #include "third_party/boringssl/src/pki/cert_errors.h"
 #include "third_party/boringssl/src/pki/parse_certificate.h"
@@ -315,6 +314,13 @@ Cronet_RESULT Cronet_EngineImpl::StartWithParams(
     dialer_context_ = nullptr;
   }
 
+  if (async_dialer_) {
+    config->async_dialer = async_dialer_;
+    config->async_dialer_context = async_dialer_context_;
+    async_dialer_ = nullptr;
+    async_dialer_context_ = nullptr;
+  }
+
   // Set custom UDP dialer if provided.
   if (udp_dialer_) {
     config->udp_dialer = udp_dialer_;
@@ -522,6 +528,14 @@ void Cronet_EngineImpl::SetDialer(int (*dialer)(void*, const char*, uint16_t),
   dialer_context_ = context;
 }
 
+void Cronet_EngineImpl::SetAsyncDialer(
+    void (*dialer)(void*, const char*, uint16_t, uint64_t),
+    void* context) {
+  CHECK(!context_);
+  async_dialer_ = dialer;
+  async_dialer_context_ = context;
+}
+
 void Cronet_EngineImpl::SetUdpDialer(
     int (*dialer)(void*, const char*, uint16_t, char*, uint16_t*),
     void* context) {
@@ -535,24 +549,12 @@ void Cronet_EngineImpl::CloseAllConnections() {
   base::AutoLock lock(lock_);
   if (!context_)
     return;
-  base::WaitableEvent done;
-  context_->PostTaskToNetworkThread(
-      FROM_HERE,
-      base::BindOnce(
-          [](CronetContext* ctx, base::WaitableEvent* event) {
-            auto* context = ctx->GetURLRequestContext();
-            if (context && context->http_transaction_factory()) {
-              auto* session =
-                  context->http_transaction_factory()->GetSession();
-              if (session) {
-                session->CloseAllConnections(net::ERR_ABORTED,
-                                             "CloseAllConnections()");
-              }
-            }
-            event->Signal();
-          },
-          context_.get(), &done));
-  done.Wait();
+  // Posted, not waited for. The caller may hold its own locks while the network
+  // thread is busy for an unbounded time, and a caller on the network thread
+  // would wait on itself. Network-thread tasks run in posting order, so work the
+  // caller posts afterwards (a new stream, a dial after Retarget) runs after the
+  // close.
+  context_->PostCloseAllConnections();
 }
 
 stream_engine* Cronet_EngineImpl::GetBidirectionalStreamEngine() {
@@ -594,6 +596,19 @@ CRONET_EXPORT void Cronet_Engine_SetDialer(Cronet_EnginePtr engine,
   cronet::Cronet_EngineImpl* engine_impl =
       static_cast<cronet::Cronet_EngineImpl*>(engine);
   engine_impl->SetDialer(dialer, context);
+}
+
+CRONET_EXPORT void Cronet_Engine_SetAsyncDialer(Cronet_EnginePtr engine,
+                                                Cronet_AsyncDialerFunc dialer,
+                                                void* context) {
+  cronet::Cronet_EngineImpl* engine_impl =
+      static_cast<cronet::Cronet_EngineImpl*>(engine);
+  engine_impl->SetAsyncDialer(dialer, context);
+}
+
+CRONET_EXPORT void Cronet_Engine_CompleteAsyncDial(uint64_t dial_id,
+                                                   int result) {
+  net::CustomClientSocketFactory::CompleteAsyncDial(dial_id, result);
 }
 
 CRONET_EXPORT void Cronet_Engine_SetUdpDialer(Cronet_EnginePtr engine,

@@ -65,6 +65,34 @@ CRONET_EXPORT void Cronet_Engine_SetDialer(Cronet_EnginePtr engine,
                                            Cronet_DialerFunc dialer,
                                            void* context);
 
+// Asynchronous TCP dialer callback type.
+// context: User-provided context pointer passed to Cronet_Engine_SetAsyncDialer.
+// address: IP address string (e.g. "1.2.3.4" or "::1").
+// port: Port number.
+// dial_id: Identifies this dial in Cronet_Engine_CompleteAsyncDial().
+// Runs on the engine's network thread and must return without waiting for the
+// connection. Exactly one Cronet_Engine_CompleteAsyncDial(dial_id, ...) must
+// follow, from any thread.
+typedef void (*Cronet_AsyncDialerFunc)(void* context,
+                                       const char* address,
+                                       uint16_t port,
+                                       uint64_t dial_id);
+
+// Sets the asynchronous dialer for TCP connections. Takes precedence over
+// Cronet_Engine_SetDialer. Must be called before
+// Cronet_Engine_StartWithParams().
+CRONET_EXPORT void Cronet_Engine_SetAsyncDialer(Cronet_EnginePtr engine,
+                                                Cronet_AsyncDialerFunc dialer,
+                                                void* context);
+
+// Delivers the result of an asynchronous dial. Thread-safe.
+// result: connected socket fd (>= 0), ownership passes to Cronet; or a
+//         negative net error code. A dial that Cronet no longer waits for
+//         (connect timeout, cancellation, engine shutdown) is accepted and its
+//         fd is closed.
+CRONET_EXPORT void Cronet_Engine_CompleteAsyncDial(uint64_t dial_id,
+                                                   int result);
+
 // UDP Dialer callback type for custom UDP socket creation.
 // context: User-provided context pointer passed to Cronet_Engine_SetUdpDialer.
 // address: IP address string (e.g. "1.2.3.4" or "::1").
@@ -99,6 +127,9 @@ CRONET_EXPORT void Cronet_Engine_SetUdpDialer(Cronet_EnginePtr engine,
 // and QUIC session pool. Useful for releasing connection-related memory
 // or speeding up engine shutdown.
 // Must be called after Cronet_Engine_StartWithParams().
+// Returns after posting the work to the network thread; it does not wait for
+// the connections to close. Work posted to the network thread afterwards runs
+// after it.
 CRONET_EXPORT void Cronet_Engine_CloseAllConnections(Cronet_EnginePtr engine);
 
 #ifdef __cplusplus

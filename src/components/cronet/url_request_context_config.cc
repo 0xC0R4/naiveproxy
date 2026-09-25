@@ -1045,9 +1045,20 @@ void URLRequestContextConfig::ConfigureURLRequestContextBuilder(
     context_builder->SetCertVerifier(std::move(mock_cert_verifier));
 
   // Set custom dialers if provided.
-  if (dialer || udp_dialer) {
+  if (dialer || udp_dialer || async_dialer) {
     net::CustomClientSocketFactory::DialerCallback tcp_dialer_callback;
     net::CustomClientSocketFactory::UdpDialerCallback udp_dialer_callback;
+    net::CustomClientSocketFactory::AsyncDialerCallback async_dialer_callback;
+
+    if (async_dialer) {
+      async_dialer_callback = base::BindRepeating(
+          [](void (*dialer)(void*, const char*, uint16_t, uint64_t),
+             void* context, const std::string& address, uint16_t port,
+             uint64_t dial_id) {
+            dialer(context, address.c_str(), port, dial_id);
+          },
+          async_dialer, async_dialer_context);
+    }
 
     if (dialer) {
       auto dialer_copy = dialer;
@@ -1074,7 +1085,8 @@ void URLRequestContextConfig::ConfigureURLRequestContextBuilder(
     }
 
     auto custom_factory = std::make_unique<net::CustomClientSocketFactory>(
-        std::move(tcp_dialer_callback), std::move(udp_dialer_callback));
+        std::move(tcp_dialer_callback), std::move(udp_dialer_callback),
+        std::move(async_dialer_callback));
     context_builder->set_client_socket_factory(std::move(custom_factory));
   }
   // TODO(mef): Use |config| to set cookies.

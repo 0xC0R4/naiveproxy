@@ -4,12 +4,19 @@
 
 #include "net/socket/custom_client_socket_factory.h"
 
+#include <map>
+#include <optional>
 #include <memory>
 #include <utility>
 
 #include "base/functional/bind.h"
 #include "base/logging.h"
 #include "base/memory/raw_ptr.h"
+#include "base/memory/weak_ptr.h"
+#include "base/no_destructor.h"
+#include "base/synchronization/lock.h"
+#include "base/task/sequenced_task_runner.h"
+#include "base/thread_annotations.h"
 #include "build/build_config.h"
 
 #if BUILDFLAG(IS_WIN)
@@ -26,10 +33,12 @@
 #include "net/base/ip_endpoint.h"
 #include "net/base/net_errors.h"
 #include "net/log/net_log.h"
+#include "net/log/net_log_event_type.h"
 #include "net/log/net_log_source.h"
 #include "net/socket/client_socket_factory.h"
 #include "net/socket/next_proto.h"
 #include "net/socket/socket_descriptor.h"
+#include "net/socket/socket_tag.h"
 #include "net/socket/tcp_client_socket.h"
 #include "net/socket/tcp_socket.h"
 #include "net/socket/udp_client_socket.h"
@@ -657,12 +666,327 @@ class ConnectedTransportClientSocket : public TransportClientSocket {
   int64_t total_received_bytes_ = 0;
 };
 
+
+void CloseSocketDescriptor(SocketDescriptor fd) {
+#if BUILDFLAG(IS_WIN)
+  closesocket(fd);
+#else
+  close(fd);
+#endif
+}
+
+// Owns the result of an asynchronous dial until a socket adopts it. A
+// descriptor that is never released (the requesting socket was destroyed, the
+// delivery task was dropped at shutdown) is closed on destruction.
+class AsyncDialResult {
+ public:
+  explicit AsyncDialResult(int result) : result_(result) {}
+  AsyncDialResult(AsyncDialResult&& other)
+      : result_(std::exchange(other.result_, ERR_ABORTED)) {}
+  AsyncDialResult& operator=(AsyncDialResult&&) = delete;
+  AsyncDialResult(const AsyncDialResult&) = delete;
+  AsyncDialResult& operator=(const AsyncDialResult&) = delete;
+  ~AsyncDialResult() {
+    if (result_ >= 0) {
+      CloseSocketDescriptor(static_cast<SocketDescriptor>(result_));
+    }
+  }
+
+  int result() const { return result_; }
+
+  // Transfers the descriptor to the caller. Only valid when result() >= 0.
+  SocketDescriptor Release() {
+    DCHECK_GE(result_, 0);
+    return static_cast<SocketDescriptor>(std::exchange(result_, ERR_ABORTED));
+  }
+
+ private:
+  int result_;
+};
+
+class AsyncTransportClientSocket;
+
+// Process-wide map from dial id to the socket waiting for it. CompleteAsyncDial
+// arrives on an embedder thread, so the entry carries the socket's task runner
+// and a WeakPtr that is only dereferenced there.
+class AsyncDialRegistry {
+ public:
+  struct Pending {
+    scoped_refptr<base::SequencedTaskRunner> task_runner;
+    base::WeakPtr<AsyncTransportClientSocket> socket;
+  };
+
+  static AsyncDialRegistry& Get() {
+    static base::NoDestructor<AsyncDialRegistry> registry;
+    return *registry;
+  }
+
+  uint64_t Add(Pending pending) {
+    base::AutoLock lock(lock_);
+    uint64_t id = next_id_++;
+    pending_.emplace(id, std::move(pending));
+    return id;
+  }
+
+  std::optional<Pending> Take(uint64_t id) {
+    base::AutoLock lock(lock_);
+    auto it = pending_.find(id);
+    if (it == pending_.end()) {
+      return std::nullopt;
+    }
+    Pending pending = std::move(it->second);
+    pending_.erase(it);
+    return pending;
+  }
+
+  void Remove(uint64_t id) {
+    base::AutoLock lock(lock_);
+    pending_.erase(id);
+  }
+
+ private:
+  base::Lock lock_;
+  uint64_t next_id_ GUARDED_BY(lock_) = 1;
+  std::map<uint64_t, Pending> pending_ GUARDED_BY(lock_);
+};
+
+// A TransportClientSocket whose connection is established by the embedder's
+// asynchronous dialer. Connect() hands the address to the dialer and returns
+// ERR_IO_PENDING; the result comes back through
+// CustomClientSocketFactory::CompleteAsyncDial as a posted task. The network
+// thread therefore never blocks on an embedder dial, and Chromium's own connect
+// timeouts and address fallbacks, which destroy the socket, cancel the dial.
+class AsyncTransportClientSocket : public TransportClientSocket {
+ public:
+  AsyncTransportClientSocket(
+      CustomClientSocketFactory::AsyncDialerCallback dialer,
+      const AddressList& addresses,
+      std::unique_ptr<SocketPerformanceWatcher> socket_performance_watcher,
+      class NetLog* net_log,
+      const NetLogSource& source)
+      : dialer_(std::move(dialer)),
+        addresses_(addresses),
+        socket_performance_watcher_(std::move(socket_performance_watcher)),
+        net_log_(NetLogWithSource::Make(net_log, NetLogSourceType::SOCKET)) {
+    net_log_.BeginEventReferencingSource(NetLogEventType::SOCKET_ALIVE,
+                                         source);
+  }
+
+  ~AsyncTransportClientSocket() override {
+    Disconnect();
+    net_log_.EndEvent(NetLogEventType::SOCKET_ALIVE);
+  }
+
+  int Bind(const IPEndPoint& local_addr) override { return ERR_FAILED; }
+
+  bool SetNoDelay(bool no_delay) override {
+    if (socket_) {
+      return socket_->SetNoDelay(no_delay);
+    }
+    return true;
+  }
+
+  bool SetKeepAlive(bool enable, int delay_secs) override {
+    if (socket_) {
+      return socket_->SetKeepAlive(enable, delay_secs);
+    }
+    return true;
+  }
+
+  int Connect(CompletionOnceCallback callback) override {
+    if (socket_) {
+      return OK;
+    }
+    DCHECK(!connect_callback_);
+    if (addresses_.empty()) {
+      return ERR_NAME_NOT_RESOLVED;
+    }
+    net_log_.BeginEvent(NetLogEventType::TCP_CONNECT);
+    connect_callback_ = std::move(callback);
+    address_index_ = 0;
+    StartDial();
+    return ERR_IO_PENDING;
+  }
+
+  void Disconnect() override {
+    CancelDial();
+    connect_callback_.Reset();
+    if (socket_) {
+      socket_->Close();
+      socket_.reset();
+    }
+  }
+
+  bool IsConnected() const override {
+    return socket_ && socket_->IsConnected();
+  }
+  bool IsConnectedAndIdle() const override {
+    return socket_ && socket_->IsConnectedAndIdle();
+  }
+  int GetPeerAddress(IPEndPoint* address) const override {
+    if (!socket_) {
+      return ERR_SOCKET_NOT_CONNECTED;
+    }
+    *address = addresses_[address_index_];
+    return OK;
+  }
+  int GetLocalAddress(IPEndPoint* address) const override {
+    if (!socket_) {
+      return ERR_SOCKET_NOT_CONNECTED;
+    }
+    return socket_->GetLocalAddress(address);
+  }
+  const NetLogWithSource& NetLog() const override { return net_log_; }
+  bool WasEverUsed() const override { return was_ever_used_; }
+  NextProto GetNegotiatedProtocol() const override {
+    return NextProto::kProtoUnknown;
+  }
+  bool GetSSLInfo(SSLInfo* ssl_info) override { return false; }
+  int64_t GetTotalReceivedBytes() const override {
+    return total_received_bytes_;
+  }
+  void ApplySocketTag(const SocketTag& tag) override {
+    tag_ = tag;
+    if (socket_) {
+      socket_->ApplySocketTag(tag);
+    }
+  }
+  int Read(IOBuffer* buf,
+           int buf_len,
+           CompletionOnceCallback callback) override {
+    if (!socket_) {
+      return ERR_SOCKET_NOT_CONNECTED;
+    }
+    int result = socket_->Read(buf, buf_len, std::move(callback));
+    if (result > 0) {
+      was_ever_used_ = true;
+      total_received_bytes_ += result;
+    }
+    return result;
+  }
+  int Write(IOBuffer* buf,
+            int buf_len,
+            CompletionOnceCallback callback,
+            const NetworkTrafficAnnotationTag& traffic_annotation) override {
+    if (!socket_) {
+      return ERR_SOCKET_NOT_CONNECTED;
+    }
+    int result =
+        socket_->Write(buf, buf_len, std::move(callback), traffic_annotation);
+    if (result > 0) {
+      was_ever_used_ = true;
+    }
+    return result;
+  }
+  int SetReceiveBufferSize(int32_t size) override {
+    if (!socket_) {
+      return ERR_SOCKET_NOT_CONNECTED;
+    }
+    return socket_->SetReceiveBufferSize(size);
+  }
+  int SetSendBufferSize(int32_t size) override {
+    if (!socket_) {
+      return ERR_SOCKET_NOT_CONNECTED;
+    }
+    return socket_->SetSendBufferSize(size);
+  }
+
+  // Runs on the socket's task runner. |socket| may be gone; |result| then
+  // closes any descriptor it holds.
+  static void DeliverDialResult(base::WeakPtr<AsyncTransportClientSocket> socket,
+                                uint64_t dial_id,
+                                AsyncDialResult result) {
+    if (!socket || socket->dial_id_ != dial_id) {
+      return;
+    }
+    socket->OnDialComplete(std::move(result));
+  }
+
+ private:
+  void StartDial() {
+    const IPEndPoint& endpoint = addresses_[address_index_];
+    dial_id_ = AsyncDialRegistry::Get().Add(
+        {base::SequencedTaskRunner::GetCurrentDefault(),
+         weak_factory_.GetWeakPtr()});
+    // The dialer may complete synchronously; the result is still delivered as
+    // a posted task, so no reentrancy into this object happens here.
+    dialer_.Run(endpoint.ToStringWithoutPort(), endpoint.port(), dial_id_);
+  }
+
+  void CancelDial() {
+    if (dial_id_ != 0) {
+      AsyncDialRegistry::Get().Remove(dial_id_);
+      dial_id_ = 0;
+      net_log_.EndEventWithNetErrorCode(NetLogEventType::TCP_CONNECT,
+                                        ERR_ABORTED);
+    }
+  }
+
+  void OnDialComplete(AsyncDialResult result) {
+    dial_id_ = 0;
+    int rv = result.result();
+    if (rv >= 0) {
+      const IPEndPoint& endpoint = addresses_[address_index_];
+      auto tcp_socket =
+          TCPSocket::Create(std::move(socket_performance_watcher_),
+                            net_log_.net_log(), net_log_.source());
+      // AdoptConnectedSocket owns the descriptor from here on: its failure
+      // paths close it, except an invalid peer address, which an AddressList
+      // endpoint cannot be.
+      rv = tcp_socket->AdoptConnectedSocket(result.Release(), endpoint);
+      if (rv == OK) {
+        tcp_socket->SetDefaultOptionsForClient();
+        tcp_socket->ApplySocketTag(tag_);
+        socket_ = std::move(tcp_socket);
+      }
+    }
+    if (rv != OK && address_index_ + 1 < addresses_.size()) {
+      ++address_index_;
+      StartDial();
+      return;
+    }
+    net_log_.EndEventWithNetErrorCode(NetLogEventType::TCP_CONNECT, rv);
+    std::move(connect_callback_).Run(rv);
+  }
+
+  CustomClientSocketFactory::AsyncDialerCallback dialer_;
+  const AddressList addresses_;
+  size_t address_index_ = 0;
+  std::unique_ptr<SocketPerformanceWatcher> socket_performance_watcher_;
+  NetLogWithSource net_log_;
+  std::unique_ptr<TCPSocket> socket_;
+  CompletionOnceCallback connect_callback_;
+  SocketTag tag_;
+  uint64_t dial_id_ = 0;
+  bool was_ever_used_ = false;
+  int64_t total_received_bytes_ = 0;
+  base::WeakPtrFactory<AsyncTransportClientSocket> weak_factory_{this};
+};
+
 }  // namespace
 
 CustomClientSocketFactory::CustomClientSocketFactory(DialerCallback tcp_dialer,
-                                                     UdpDialerCallback udp_dialer)
-    : tcp_dialer_(std::move(tcp_dialer)), udp_dialer_(std::move(udp_dialer)) {
-  DCHECK(tcp_dialer_ || udp_dialer_);
+                                                     UdpDialerCallback udp_dialer,
+                                                     AsyncDialerCallback async_tcp_dialer)
+    : tcp_dialer_(std::move(tcp_dialer)),
+      udp_dialer_(std::move(udp_dialer)),
+      async_tcp_dialer_(std::move(async_tcp_dialer)) {
+  DCHECK(tcp_dialer_ || udp_dialer_ || async_tcp_dialer_);
+}
+
+// static
+void CustomClientSocketFactory::CompleteAsyncDial(uint64_t dial_id,
+                                                  int result) {
+  AsyncDialResult owned(result);
+  std::optional<AsyncDialRegistry::Pending> pending =
+      AsyncDialRegistry::Get().Take(dial_id);
+  if (!pending) {
+    return;
+  }
+  pending->task_runner->PostTask(
+      FROM_HERE,
+      base::BindOnce(&AsyncTransportClientSocket::DeliverDialResult,
+                     std::move(pending->socket), dial_id, std::move(owned)));
 }
 
 CustomClientSocketFactory::~CustomClientSocketFactory() = default;
@@ -687,6 +1011,11 @@ CustomClientSocketFactory::CreateTransportClientSocket(
     NetworkQualityEstimator* network_quality_estimator,
     NetLog* net_log,
     const NetLogSource& source) {
+  if (async_tcp_dialer_) {
+    return std::make_unique<AsyncTransportClientSocket>(
+        async_tcp_dialer_, addresses, std::move(socket_performance_watcher),
+        net_log, source);
+  }
   if (!tcp_dialer_) {
     return ClientSocketFactory::GetDefaultFactory()->CreateTransportClientSocket(
         addresses, std::move(socket_performance_watcher),
@@ -702,13 +1031,10 @@ CustomClientSocketFactory::CreateTransportClientSocket(
       SocketDescriptor socket_fd = static_cast<SocketDescriptor>(result);
       auto tcp_socket = TCPSocket::Create(std::move(socket_performance_watcher),
                                           net_log, source);
+      // AdoptConnectedSocket owns the descriptor: its failure paths close it,
+      // except an invalid peer address, which an AddressList endpoint cannot be.
       int adopt_result = tcp_socket->AdoptConnectedSocket(socket_fd, endpoint);
       if (adopt_result != OK) {
-#if BUILDFLAG(IS_WIN)
-        closesocket(socket_fd);
-#else
-        close(socket_fd);
-#endif
         return std::make_unique<FailingTransportClientSocket>(
             adopt_result, addresses, net_log, source);
       }

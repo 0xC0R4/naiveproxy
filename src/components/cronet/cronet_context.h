@@ -161,6 +161,13 @@ class CronetContext {
   // Returns true if running on network thread.
   bool IsOnNetworkThread() const;
 
+  // Posts closing every connection of the default context's network session to
+  // the network thread and returns without waiting. Callable from any thread,
+  // including the network thread. The task is bound to |network_tasks_|, which
+  // ~CronetContext deletes with a task posted after it, so it stays valid even
+  // if this context is destroyed before the task runs.
+  void PostCloseAllConnections();
+
   // Returns the net::URLRequestContext associated with `network`.
   // kInvalidNetworkHandle represent the default context: this one will always
   // be present and used whenever a requests doesn't specify a target network
@@ -297,6 +304,9 @@ class CronetContext {
 
     net::URLRequestContext* GetURLRequestContext(
         net::handles::NetworkHandle network);
+
+    // Closes every connection of the default context's network session.
+    void CloseAllConnections();
 
     // Same as StartNetLogToDisk.
     void StartNetLogToBoundedFile(const std::string& dir_path,

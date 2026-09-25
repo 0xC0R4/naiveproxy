@@ -197,6 +197,13 @@ struct URLRequestContextConfig {
   int (*udp_dialer)(void*, const char*, uint16_t, char*, uint16_t*) = nullptr;
   void* udp_dialer_context = nullptr;
 
+  // Asynchronous TCP dialer. Takes precedence over |dialer|. The callback takes
+  // (context, address, port, dial_id), must return without waiting for the
+  // connection, and the result is delivered with
+  // net::CustomClientSocketFactory::CompleteAsyncDial(dial_id, result).
+  void (*async_dialer)(void*, const char*, uint16_t, uint64_t) = nullptr;
+  void* async_dialer_context = nullptr;
+
   static bool ExperimentalOptionsParsingIsAllowedToFail() {
     return DCHECK_IS_ON();
   }

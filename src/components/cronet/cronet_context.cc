@@ -42,6 +42,8 @@
 #include "net/base/load_flags.h"
 #include "net/base/logging_network_change_observer.h"
 #include "net/base/net_errors.h"
+#include "net/http/http_network_session.h"
+#include "net/http/http_transaction_factory.h"
 #include "net/base/network_delegate_impl.h"
 #include "net/base/network_isolation_key.h"
 #include "net/base/proxy_delegate.h"
@@ -649,6 +651,30 @@ void CronetContext::NetworkTasks::RunTaskAfterContextInit(
     return;
   }
   tasks_waiting_for_context_.push(std::move(task_to_run_after_context_init));
+}
+
+void CronetContext::PostCloseAllConnections() {
+  GetNetworkTaskRunner()->PostTask(
+      FROM_HERE,
+      base::BindOnce(
+          &CronetContext::NetworkTasks::RunTaskAfterContextInit,
+          base::Unretained(network_tasks_),
+          base::BindOnce(&CronetContext::NetworkTasks::CloseAllConnections,
+                         base::Unretained(network_tasks_))));
+}
+
+void CronetContext::NetworkTasks::CloseAllConnections() {
+  DCHECK_CALLED_ON_VALID_THREAD(network_thread_checker_);
+  net::URLRequestContext* context =
+      GetURLRequestContext(net::handles::kInvalidNetworkHandle);
+  if (!context || !context->http_transaction_factory()) {
+    return;
+  }
+  net::HttpNetworkSession* session =
+      context->http_transaction_factory()->GetSession();
+  if (session) {
+    session->CloseAllConnections(net::ERR_ABORTED, "CloseAllConnections()");
+  }
 }
 
 bool CronetContext::IsOnNetworkThread() const {
