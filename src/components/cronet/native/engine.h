@@ -65,6 +65,11 @@ class Cronet_EngineImpl : public Cronet_Engine {
   void SetDialer(intptr_t (*dialer)(void*, const char*, uint16_t),
                  void* context);
 
+  // Set asynchronous dialer for TCP connections. Takes precedence over
+  // SetDialer. Must be called before StartWithParams.
+  void SetAsyncDialer(void (*dialer)(void*, const char*, uint16_t, uint64_t),
+                      void* context);
+
   // Set custom dialer for UDP sockets. Must be called before StartWithParams.
   void SetUdpDialer(intptr_t (*dialer)(void*,
                                        const char*,
@@ -127,6 +132,10 @@ class Cronet_EngineImpl : public Cronet_Engine {
   // Custom dialer for TCP connections. Only valid until StartWithParams.
   intptr_t (*dialer_)(void*, const char*, uint16_t) = nullptr;
   void* dialer_context_ = nullptr;
+
+  // Asynchronous TCP dialer. Only valid until StartWithParams.
+  void (*async_dialer_)(void*, const char*, uint16_t, uint64_t) = nullptr;
+  void* async_dialer_context_ = nullptr;
 
   // Custom dialer for UDP sockets. Only valid until StartWithParams.
   intptr_t (*udp_dialer_)(void*,

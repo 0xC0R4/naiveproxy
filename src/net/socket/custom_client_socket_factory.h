@@ -49,8 +49,25 @@ class NET_EXPORT CustomClientSocketFactory : public ClientSocketFactory {
                                        uint16_t* out_local_port,
                                        base::OnceClosure* on_close)>;
 
+  // Callback type for the asynchronous TCP dialer.
+  // Parameters:
+  //   - address: IP address string (e.g. "1.2.3.4" or "::1")
+  //   - port: Port number
+  //   - dial_id: Identifies this dial in CompleteAsyncDial().
+  // The callback runs on the network thread and must return without waiting
+  // for the connection. The embedder later calls CompleteAsyncDial(dial_id,
+  // result) exactly once, from any thread, with a connected socket descriptor
+  // (>= 0) or a negative net error code. Descriptors delivered after the
+  // requesting socket is gone are closed by the factory.
+  using AsyncDialerCallback = base::RepeatingCallback<
+      void(const std::string& address, uint16_t port, uint64_t dial_id)>;
+
+  // When |async_tcp_dialer| is set it takes precedence over |tcp_dialer|: the
+  // network thread never waits on an embedder dial.
   CustomClientSocketFactory(DialerCallback tcp_dialer,
-                            UdpDialerCallback udp_dialer);
+                            UdpDialerCallback udp_dialer,
+                            AsyncDialerCallback async_tcp_dialer =
+                                AsyncDialerCallback());
   ~CustomClientSocketFactory() override;
 
   CustomClientSocketFactory(const CustomClientSocketFactory&) = delete;
@@ -78,9 +95,16 @@ class NET_EXPORT CustomClientSocketFactory : public ClientSocketFactory {
       const HostPortPair& host_and_port,
       const SSLConfig& ssl_config) override;
 
+  // Delivers the result of an asynchronous dial. Thread-safe. |result| is a
+  // connected socket (fd, or SOCKET on Windows) or a negative net error code.
+  // Unknown or
+  // already-cancelled |dial_id|s are accepted; a descriptor is then closed.
+  static void CompleteAsyncDial(uint64_t dial_id, intptr_t result);
+
  private:
   DialerCallback tcp_dialer_;
   UdpDialerCallback udp_dialer_;
+  AsyncDialerCallback async_tcp_dialer_;
 };
 
 }  // namespace net
