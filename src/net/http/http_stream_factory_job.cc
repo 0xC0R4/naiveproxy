@@ -767,8 +767,15 @@ int HttpStreamFactory::Job::DoInitConnectionImpl() {
             !is_blocking_request_for_session) {
           net_log_.AddEvent(NetLogEventType::HTTP_STREAM_JOB_THROTTLED);
           next_state_ = STATE_INIT_CONNECTION;
-          TaskRunner(priority_)->PostDelayedTask(
-              FROM_HERE, resume_callback, base::Milliseconds(kHTTP2ThrottleMs));
+          // With assume_http2 the job waits for the blocking request: it
+          // resumes through OnSpdySessionAvailable() when the session is
+          // created, or through the deferred callback when the blocking
+          // request is destroyed without one.
+          if (!request_info_.assume_http2) {
+            TaskRunner(priority_)->PostDelayedTask(
+                FROM_HERE, resume_callback,
+                base::Milliseconds(kHTTP2ThrottleMs));
+          }
           return ERR_IO_PENDING;
         }
       } else if (enable_ip_based_pooling_for_h2_) {
@@ -1396,6 +1403,10 @@ bool HttpStreamFactory::Job::ShouldThrottleConnectForSpdy() const {
   // If the job has previously been throttled, don't throttle it again.
   if (init_connection_already_resumed_) {
     return false;
+  }
+
+  if (request_info_.assume_http2) {
+    return true;
   }
 
   // Only throttle the request if the server is believed to support H2.

@@ -107,7 +107,8 @@ HttpStreamFactory::StreamRequestInfo::StreamRequestInfo(
       secure_dns_policy(http_request_info.secure_dns_policy),
       socket_tag(http_request_info.socket_tag),
       target_network(http_request_info.target_network),
-      force_quic(http_request_info.force_quic) {}
+      force_quic(http_request_info.force_quic),
+      assume_http2(http_request_info.assume_http2) {}
 
 HttpStreamFactory::StreamRequestInfo::StreamRequestInfo(
     const StreamRequestInfo& other) = default;

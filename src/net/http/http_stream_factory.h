@@ -110,6 +110,9 @@ class NET_EXPORT HttpStreamFactory {
 
     // When true, force this request to use QUIC without TCP/HTTP fallback.
     bool force_quic = false;
+
+    // See HttpRequestInfo::assume_http2.
+    bool assume_http2 = false;
   };
 
   // Calculates an appropriate SPDY session key for the given parameters.

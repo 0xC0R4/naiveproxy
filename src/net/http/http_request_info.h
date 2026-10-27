@@ -152,6 +152,11 @@ struct NET_EXPORT HttpRequestInfo {
 
   // When true, force this request to use QUIC without TCP/HTTP fallback.
   bool force_quic = false;
+
+  // When true, the server is known to support HTTP/2: concurrent requests to
+  // the same SpdySessionKey wait for the first connection instead of each
+  // opening its own, with no kHTTP2ThrottleMs timeout.
+  bool assume_http2 = false;
 };
 
 }  // namespace net
