@@ -221,6 +221,11 @@ void BidirectionalStream::StartRequest() {
     request_info_->extra_headers.RemoveHeader("-force-quic");
     http_request_info.force_quic = (*force_quic_header == "true");
   }
+  if (auto assume_http2_header =
+          request_info_->extra_headers.GetHeader("-assume-h2")) {
+    request_info_->extra_headers.RemoveHeader("-assume-h2");
+    http_request_info.assume_http2 = (*assume_http2_header == "true");
+  }
   http_request_info.extra_headers = request_info_->extra_headers;
   http_request_info.socket_tag = request_info_->socket_tag;
   stream_request_ =
