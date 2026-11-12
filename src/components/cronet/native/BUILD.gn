@@ -4,6 +4,7 @@
 
 import("//components/cronet/native/include/headers.gni")
 import("//components/grpc_support/include/headers.gni")
+import("//net/features.gni")
 
 config("cronet_native_include_config") {
   include_dirs = [
@@ -68,4 +69,8 @@ source_set("cronet_native_impl") {
     "generated/cronet.idl_impl_interface.cc",
     "generated/cronet.idl_impl_struct.cc",
   ]
+
+  if (enable_websockets) {
+    sources += [ "websocket.cc" ]
+  }
 }
