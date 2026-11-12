@@ -29,6 +29,7 @@
 #include "components/cronet/native/engine.h"
 #include "components/cronet/native/include/cronet_c.h"
 #include "components/grpc_support/include/bidirectional_stream_c.h"
+#include "net/base/auth.h"
 #include "net/base/io_buffer.h"
 #include "net/base/isolation_info.h"
 #include "net/base/net_errors.h"
