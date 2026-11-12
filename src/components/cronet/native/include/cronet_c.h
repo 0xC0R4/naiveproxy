@@ -5,6 +5,8 @@
 #ifndef COMPONENTS_CRONET_NATIVE_INCLUDE_CRONET_C_H_
 #define COMPONENTS_CRONET_NATIVE_INCLUDE_CRONET_C_H_
 
+#include <stddef.h>
+
 #include "cronet_export.h"
 
 // Cronet public C API is generated from cronet.idl
@@ -131,6 +133,81 @@ CRONET_EXPORT void Cronet_Engine_SetUdpDialer(Cronet_EnginePtr engine,
 // the connections to close. Work posted to the network thread afterwards runs
 // after it.
 CRONET_EXPORT void Cronet_Engine_CloseAllConnections(Cronet_EnginePtr engine);
+
+// WebSocket client on an engine's URL request context. The connection uses the
+// engine's socket factory, DNS, certificate verification and connection pools:
+// HTTP/1.1 Upgrade, or RFC 8441 / RFC 9220 when the server's SETTINGS allow it.
+// Callbacks run synchronously on the engine's network thread and must not
+// block. All other functions may be called from any thread; they post to the
+// network thread.
+typedef struct Cronet_WebSocket Cronet_WebSocket;
+typedef Cronet_WebSocket* Cronet_WebSocketPtr;
+
+typedef struct Cronet_WebSocketHeader {
+  const char* name;
+  const char* value;
+} Cronet_WebSocketHeader;
+
+typedef struct Cronet_WebSocketCallbacks {
+  // The opening handshake succeeded. |headers| holds ":status" followed by the
+  // response header lines; valid only during the call.
+  void (*on_connected)(Cronet_WebSocketPtr ws,
+                       const Cronet_WebSocketHeader* headers,
+                       size_t header_count);
+  // Payload bytes of a received data message (text or binary; message
+  // boundaries are not reported), valid only during the call. Returning 0
+  // stops reading from the connection after the frames already read; reading
+  // resumes on Cronet_WebSocket_ReadMore(). Returning nonzero keeps reading.
+  int (*on_data)(Cronet_WebSocketPtr ws, const char* data, size_t size);
+  // Every message passed to Cronet_WebSocket_Send() so far has been written
+  // to the connection.
+  void (*on_send_done)(Cronet_WebSocketPtr ws);
+  // The connection has ended; no callback follows. |net_error| is 0 after a
+  // completed closing handshake, otherwise a net error. |code| is the close
+  // code of a dropped connection, or the HTTP status of a rejected opening
+  // handshake (0 when there is none).
+  void (*on_closed)(Cronet_WebSocketPtr ws,
+                    int net_error,
+                    int code,
+                    const char* reason);
+} Cronet_WebSocketCallbacks;
+
+// Creates a WebSocket on a started engine. |callbacks| must stay valid until
+// the WebSocket is destroyed. Returns nullptr when the engine is not running.
+// The WebSocket must be destroyed before Cronet_Engine_Shutdown().
+CRONET_EXPORT Cronet_WebSocketPtr
+Cronet_WebSocket_Create(Cronet_EnginePtr engine,
+                        const Cronet_WebSocketCallbacks* callbacks);
+
+// Starts the opening handshake to |url| (ws:// or wss://). |origin| is the
+// Origin header value; empty or nullptr uses the https origin of |url|.
+// |headers| are extra request headers. Returns 0 on success, -1 for an invalid
+// URL or origin, or the 1-based index of an invalid header.
+CRONET_EXPORT int Cronet_WebSocket_Start(Cronet_WebSocketPtr ws,
+                                         const char* url,
+                                         const char* origin,
+                                         const Cronet_WebSocketHeader* headers,
+                                         size_t header_count);
+
+// Sends |data| as one binary message; the bytes are copied. Only valid after
+// on_connected. Ignored once closing has started.
+CRONET_EXPORT void Cronet_WebSocket_Send(Cronet_WebSocketPtr ws,
+                                         const char* data,
+                                         size_t size);
+
+// Resumes reading after on_data returned 0.
+CRONET_EXPORT void Cronet_WebSocket_ReadMore(Cronet_WebSocketPtr ws);
+
+// Starts the closing handshake with |code| (1000-4999) and |reason|; before
+// the opening handshake completes, abandons it. on_closed follows.
+CRONET_EXPORT void Cronet_WebSocket_Close(Cronet_WebSocketPtr ws,
+                                          int code,
+                                          const char* reason);
+
+// Destroys the WebSocket, dropping the connection without a closing handshake
+// if it is still open. Callbacks already posted may still run until the
+// destruction task runs on the network thread; none run afterwards.
+CRONET_EXPORT void Cronet_WebSocket_Destroy(Cronet_WebSocketPtr ws);
 
 #ifdef __cplusplus
 }
