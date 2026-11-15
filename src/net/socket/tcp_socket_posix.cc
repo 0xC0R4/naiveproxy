@@ -523,6 +523,16 @@ void TCPSocketPosix::SetDefaultOptionsForClient() {
 #if !BUILDFLAG(IS_ANDROID) && !BUILDFLAG(IS_IOS)
   const int kTCPKeepAliveSeconds = 45;
 
+  // An embedder dialer (CustomClientSocketFactory) may hand over an AF_UNIX
+  // socketpair end, which has no TCP options. getsockname() rather than
+  // SO_DOMAIN, which only Linux has.
+  sockaddr_storage addr;
+  socklen_t addr_len = sizeof(addr);
+  if (getsockname(socket_->socket_fd(), reinterpret_cast<sockaddr*>(&addr),
+                  &addr_len) == 0 &&
+      addr.ss_family == AF_UNIX) {
+    return;
+  }
   SetTCPKeepAlive(socket_->socket_fd(), true, kTCPKeepAliveSeconds);
 #endif
 }
