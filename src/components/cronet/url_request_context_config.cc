@@ -9,6 +9,7 @@
 #include <type_traits>
 #include <utility>
 
+#include "base/containers/extend.h"
 #include "base/feature_list.h"
 #include "base/json/json_reader.h"
 #include "base/json/json_writer.h"
@@ -23,12 +24,14 @@
 #include "components/cronet/cronet_proxy_delegate.h"
 #include "net/base/address_family.h"
 #include "net/base/cronet_buildflags.h"
+#include "net/base/features.h"
 #include "net/base/ip_address.h"
 #include "net/base/url_util.h"
 #include "net/cert/caching_cert_verifier.h"
 #include "net/cert/cert_verifier.h"
 #include "net/cert/cert_verify_proc.h"
 #include "net/cert/multi_threaded_cert_verifier.h"
+#include "net/cert/x509_util.h"
 #include "net/dns/context_host_resolver.h"
 #include "net/dns/host_resolver.h"
 #include "net/dns/mapped_host_resolver.h"
@@ -44,6 +47,8 @@
 #include "net/socket/client_socket_pool_manager.h"
 #include "net/socket/custom_client_socket_factory.h"
 #include "net/socket/ssl_client_socket.h"
+#include "net/ssl/ech_mode_getter.h"
+#include "net/ssl/ssl_config_service_defaults.h"
 #include "net/ssl/ssl_key_logger_impl.h"
 #include "net/third_party/quiche/src/quiche/http2/core/spdy_protocol.h"
 #include "net/third_party/quiche/src/quiche/quic/core/crypto/crypto_protocol.h"
@@ -56,6 +61,14 @@
 #if BUILDFLAG(ENABLE_REPORTING)
 #include "net/reporting/reporting_policy.h"
 #endif  // BUILDFLAG(ENABLE_REPORTING)
+
+#if BUILDFLAG(IS_ANDROID)
+#include "net/ssl/ech_mode_getter_android.h"
+#endif  // BUILDFLAG(IS_ANDROID)
+
+#if BUILDFLAG(CHROME_ROOT_STORE_SUPPORTED)
+#include "net/cert/internal/trust_store_chrome.h"
+#endif  // BUILDFLAG(CHROME_ROOT_STORE_SUPPORTED)
 
 namespace cronet {
 
@@ -301,6 +314,46 @@ auto map(std::optional<T> maybe, F&& f) {
     return std::optional<std::invoke_result_t<F, T>>();
   return std::optional<std::invoke_result_t<F, T>>(f(maybe.value()));
 }
+
+// SSLConfigServiceDefaults plus the TLS Trust Anchor IDs that Chrome
+// advertises (chrome/browser/ssl/ssl_config_service_manager.cc; the same code
+// as net/tools/naive/naive_proxy_bin.cc). Without it the ClientHello lacks the
+// trust_anchors extension Chrome sends. Platforms without the Chrome Root Store
+// (iOS) send no IDs, as Chrome does there.
+class CronetSSLConfigService : public net::SSLConfigServiceDefaults {
+ public:
+  explicit CronetSSLConfigService(
+      std::unique_ptr<net::EchModeGetter> ech_mode_getter)
+      : SSLConfigServiceDefaults(std::move(ech_mode_getter)) {
+#if BUILDFLAG(CHROME_ROOT_STORE_SUPPORTED)
+    if (base::FeatureList::IsEnabled(net::features::kTLSTrustAnchorIDs)) {
+      std::vector<std::vector<uint8_t>> trust_anchor_ids;
+      if (base::FeatureList::IsEnabled(net::features::kNonMtcTrustAnchorIDs)) {
+        base::Extend(
+            trust_anchor_ids,
+            net::TrustStoreChrome::GetTrustAnchorIDsFromCompiledInRootStore());
+      }
+      if (base::FeatureList::IsEnabled(net::features::kVerifyMTCs)) {
+        base::Extend(
+            trust_anchor_ids,
+            net::TrustStoreChrome::GetTrustedMtcCaIDsFromCompiledInRootStore());
+      }
+      trust_anchor_ids_ = net::x509_util::EncodeTlsRequestedTrustAnchorIDList(
+          std::move(trust_anchor_ids));
+    }
+#endif  // BUILDFLAG(CHROME_ROOT_STORE_SUPPORTED)
+  }
+
+  net::SSLContextConfig GetSSLContextConfig() override {
+    net::SSLContextConfig config =
+        SSLConfigServiceDefaults::GetSSLContextConfig();
+    config.trust_anchor_ids = trust_anchor_ids_;
+    return config;
+  }
+
+ private:
+  std::vector<uint8_t> trust_anchor_ids_;
+};
 
 }  // namespace
 
@@ -1093,6 +1146,15 @@ void URLRequestContextConfig::ConfigureURLRequestContextBuilder(
 
   if (mock_cert_verifier)
     context_builder->SetCertVerifier(std::move(mock_cert_verifier));
+
+  // Replaces the builder's default SSLConfigServiceDefaults, with the same
+  // EchModeGetter it would use.
+  std::unique_ptr<net::EchModeGetter> ech_mode_getter;
+#if BUILDFLAG(IS_ANDROID)
+  ech_mode_getter = std::make_unique<net::EchModeGetterAndroid>();
+#endif  // BUILDFLAG(IS_ANDROID)
+  context_builder->set_ssl_config_service(
+      std::make_unique<CronetSSLConfigService>(std::move(ech_mode_getter)));
 
   // Network-bound contexts must use Chromium's network-binding socket factory.
   // cronet-go does not expose network handles, so custom dialers are installed
